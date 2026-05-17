@@ -1,0 +1,10 @@
+streamlit
+pandas
+scikit-learn
+spacy
+pdfminer.six
+openai
+streamlit-webrtc
+av
+mediapipe
+opencv-python
