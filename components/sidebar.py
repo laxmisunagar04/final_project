@@ -60,13 +60,13 @@ def render_sidebar():
             st.markdown("**Navigation**")
 
             if role == "student":
-                st.page_link("pages/4_Student_Dashboard.py", label="📊 My Dashboard", icon="🏠")
+                st.page_link("pages/4_Student_dashboard.py", label="📊 My Dashboard", icon="🏠")
                 st.page_link("pages/6_Resume_Analysis.py", label="📄 Resume Analysis", icon="📑")
                 st.page_link("pages/7_Placement_Predictor.py", label="🎯 Placement Predictor", icon="🎯")
                 st.page_link("pages/8_Recommendations.py", label="📚 Recommendations", icon="📚")
 
             elif role == "company":
-                st.page_link("pages/5_Company_Dashboard.py", label="🏢 Company Dashboard", icon="🏠")
+                st.page_link("pages/5_Company_dashboard.py", label="🏢 Company Dashboard", icon="🏠")
                 st.page_link("pages/9_Talent_Pool.py", label="🔍 Talent Pool", icon="🔍")
 
             st.divider()
@@ -78,10 +78,17 @@ def render_sidebar():
         else:
             st.markdown("**Get Started**")
 
-            st.page_link("app.py", label="🏠 Home")
-            st.page_link("pages/1_Student_Login.py", label="🎓 Student Login")
-            st.page_link("pages/2_Company_Login.py", label="🏢 Company Login")
-            st.page_link("pages/3_Signup.py", label="✍️ Sign Up")
+            if st.button("🏠 Home", use_container_width=True):
+                st.switch_page("app.py")
+
+            if st.button("🎓 Student Login", use_container_width=True):
+                st.switch_page("pages/1_Student_login.py")
+
+            if st.button("🏢 Company Login", use_container_width=True):
+                st.switch_page("pages/2_Company_login.py")
+
+            if st.button("✍️ Sign Up", use_container_width=True):
+                st.switch_page("pages/3_Signup.py")
 
         st.markdown(
             """
