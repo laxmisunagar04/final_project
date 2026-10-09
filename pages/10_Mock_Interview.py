@@ -32,10 +32,29 @@ import sys
 import threading
 import time
 import random
-import queue
+import logging
 import numpy as np
 import cv2
 import streamlit as st
+
+# The camera-check / mic-check / exam-question blocks use
+# st.fragment(run_every=1) so the live camera state, mic level,
+# and countdown timers keep refreshing every second without user
+# interaction. Those same blocks also contain buttons (Next,
+# Submit & Continue, Skip) that trigger a full-page st.rerun().
+# When a button is clicked, Streamlit discards the current
+# fragment and builds a fresh one - but the 1-second auto-refresh
+# timer that was already scheduled *before* the click can still
+# land a moment later, asking for a fragment id that no longer
+# exists. Streamlit logs that as an info/warning message and
+# simply drops the stale request; the newly created fragment's
+# own timer picks up normally on its next tick. It's expected,
+# harmless noise inherent to combining run_every with full
+# reruns - not an error - so we just drop it below WARNING here
+# instead of touching the app's actual logic.
+logging.getLogger("streamlit.runtime.fragment").setLevel(
+    logging.ERROR
+)
 
 
 # ============================================================
@@ -59,6 +78,10 @@ if PROJECT_ROOT not in sys.path:
 from auth import get_user, require_login
 from database import get_student_profile, init_db
 from interview_engine import InterviewEngine
+from interview_evaluator import evaluate_answer
+from camera_monitor import CameraMonitor
+from speech_handler import speak
+import streamlit.components.v1 as components
 
 try:
     from streamlit_webrtc import (
@@ -111,16 +134,29 @@ if "camera_monitoring" not in st.session_state:
 if "session_code" not in st.session_state:
     st.session_state.session_code = None
 
-# New: onboarding stage machine, run once before the exam itself.
-# "camera_check" -> "mic_check" -> "ready" (exam unlocked)
-if "onboard_stage" not in st.session_state:
-    st.session_state.onboard_stage = "camera_check"
+# Proctored pre-flight flow stages:
+# interview_flow_stage: "landing" -> "preflight" -> "interview"
+# preflight_step: "camera" -> "mic" -> "fullscreen"
+if "interview_flow_stage" not in st.session_state:
+    st.session_state.interview_flow_stage = "landing"
+
+if "preflight_step" not in st.session_state:
+    st.session_state.preflight_step = "camera"
 
 if "camera_check_passed" not in st.session_state:
     st.session_state.camera_check_passed = False
 
 if "mic_check_passed" not in st.session_state:
     st.session_state.mic_check_passed = False
+
+if "fullscreen_passed" not in st.session_state:
+    st.session_state.fullscreen_passed = False
+
+if "hardware_camera_ok" not in st.session_state:
+    st.session_state.hardware_camera_ok = None
+
+if "voice_tested" not in st.session_state:
+    st.session_state.voice_tested = False
 
 if "camera_stable_since" not in st.session_state:
     st.session_state.camera_stable_since = None
@@ -741,11 +777,253 @@ textarea {
     font-family: var(--font-body) !important;
 }
 
-/* expander (answer log) */
+/* expander (answer log) & details contrast */
 details {
     background: var(--panel) !important;
     border: 1px solid var(--hairline) !important;
     border-radius: 8px !important;
+    color: var(--ivory) !important;
+}
+
+details summary {
+    color: var(--ivory) !important;
+    font-weight: 600 !important;
+    font-size: 14.5px !important;
+    padding: 10px 14px !important;
+}
+
+details[open] summary {
+    color: #93C5FD !important;
+    border-bottom: 1px solid var(--hairline) !important;
+}
+
+details div[data-testid="stExpanderDetails"] {
+    background: var(--panel) !important;
+    color: var(--ivory) !important;
+    padding: 16px !important;
+}
+
+/* results screen metrics & report cards */
+div[data-testid="stMetricValue"] {
+    color: var(--ivory) !important;
+    font-weight: 700 !important;
+}
+
+div[data-testid="stMetricLabel"] {
+    color: var(--muted) !important;
+    font-weight: 600 !important;
+}
+
+.report-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin: 16px 0 20px 0;
+}
+
+.report-metric-card {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 16px 18px;
+    text-align: center;
+}
+
+.report-metric-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+}
+
+.report-metric-val {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--ivory);
+    font-family: var(--font-display);
+}
+
+.report-section-card {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 20px 22px;
+    margin-bottom: 18px;
+    text-align: left;
+}
+
+.report-section-hdr {
+    font-size: 16.5px;
+    font-weight: 700;
+    color: var(--ivory);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.report-feedback-box {
+    background: #14203A;
+    border: 1px solid var(--signal-dim);
+    border-radius: 8px;
+    padding: 14px 18px;
+    color: var(--ivory);
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.report-item-green {
+    background: var(--ok-bg);
+    border: 1px solid #1F5C36;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #86EFAC;
+    font-size: 13.5px;
+    line-height: 1.5;
+    margin-bottom: 8px;
+}
+
+.report-item-amber {
+    background: var(--warn-bg);
+    border: 1px solid #6B4A11;
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #FCD34D;
+    font-size: 13.5px;
+    line-height: 1.5;
+    margin-bottom: 8px;
+}
+
+.q-box-answer {
+    background: var(--panel-2);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--ivory);
+    font-size: 14px;
+    margin-top: 6px;
+    line-height: 1.5;
+}
+
+.q-box-skipped {
+    background: #231B10;
+    border: 1px solid #5C3D10;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #FCD34D;
+    font-size: 13.5px;
+    margin-top: 6px;
+}
+
+.feedback-pill-good {
+    background: var(--ok-bg);
+    border: 1px solid #1F5C36;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #86EFAC;
+    font-size: 13.5px;
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
+
+.feedback-pill-warn {
+    background: var(--warn-bg);
+    border: 1px solid #6B4A11;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #FCD34D;
+    font-size: 13.5px;
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
+
+.eval-score-tag {
+    display: inline-block;
+    background: var(--panel-2);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    color: var(--ivory);
+    margin-right: 8px;
+}
+
+/* ---------- pre-flight status cards & styles ---------- */
+
+.preflight-status-card {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 16px 18px;
+    text-align: left;
+    margin-bottom: 12px;
+    transition: all 0.2s ease;
+}
+
+.preflight-status-card.ready {
+    border-color: #1F5C36;
+    background: linear-gradient(180deg, #0e2016 0%, var(--panel) 100%);
+}
+
+.preflight-status-card.pending {
+    border-color: var(--hairline);
+}
+
+.preflight-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
+.preflight-card-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--ivory);
+}
+
+.status-pill {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-weight: 600;
+}
+
+.status-pill.ok {
+    background: #0E2216;
+    border: 1px solid #1F5C36;
+    color: #86EFAC;
+}
+
+.status-pill.pending {
+    background: #241A0B;
+    border: 1px solid #6B4A11;
+    color: #FCD34D;
+}
+
+.status-pill.bad {
+    background: #261114;
+    border: 1px solid #6B2226;
+    color: #FCA5A5;
+}
+
+.preflight-card-desc {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.4;
+}
+
+.preflight-box {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 14px;
 }
 
 </style>
@@ -774,6 +1052,15 @@ camera_lock = threading.Lock()
 
 class InterviewVideoProcessor(VideoProcessorBase):
 
+    _latest_instance = None
+    _latest_state = {
+        "face_count": 0,
+        "face_detected": False,
+        "movement": "No face",
+        "movement_distance": 0,
+        "frames": 0,
+    }
+
     def __init__(self):
 
         self.face_count = 0
@@ -789,13 +1076,18 @@ class InterviewVideoProcessor(VideoProcessorBase):
 
         self.running = True
 
+        self.last_faces = ()
+
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades
             + "haarcascade_frontalface_default.xml"
         )
 
+        with camera_lock:
+            InterviewVideoProcessor._latest_instance = self
+
     # --------------------------------------------------------
-    # THREAD-SAFE STATE ACCESSOR
+    # THREAD-SAFE STATE ACCESSORS
     # --------------------------------------------------------
     # streamlit-webrtc runs recv() on a dedicated background
     # processing thread, separate from the thread that executes
@@ -820,6 +1112,17 @@ class InterviewVideoProcessor(VideoProcessorBase):
                 "frames": self.frames,
             }
 
+    @classmethod
+    def get_latest_active_state(cls):
+        with camera_lock:
+            if cls._latest_instance is not None:
+                inst_state = cls._latest_instance.get_state()
+                if inst_state.get("frames", 0) > 0:
+                    return inst_state
+            if cls._latest_state.get("frames", 0) > 0:
+                return dict(cls._latest_state)
+            return None
+
     def recv(self, frame):
 
         image = frame.to_ndarray(
@@ -828,14 +1131,17 @@ class InterviewVideoProcessor(VideoProcessorBase):
 
         with camera_lock:
             self.frames += 1
+            current_frame_idx = self.frames
+            InterviewVideoProcessor._latest_instance = self
+            InterviewVideoProcessor._latest_state["frames"] = self.frames
 
         # ----------------------------------------------------
-        # Resize for faster processing
+        # Scaling parameters (processing width reduced to 480)
         # ----------------------------------------------------
 
         height, width = image.shape[:2]
 
-        processing_width = 640
+        processing_width = 480
 
         if width > processing_width:
 
@@ -843,75 +1149,89 @@ class InterviewVideoProcessor(VideoProcessorBase):
                 processing_width / width
             )
 
-            processing_height = int(
-                height * scale
-            )
-
-            small_image = cv2.resize(
-                image,
-                (
-                    processing_width,
-                    processing_height
-                )
-            )
-
-        else:
-
-            small_image = image
-
-        # ----------------------------------------------------
-        # Grayscale
-        # ----------------------------------------------------
-
-        gray = cv2.cvtColor(
-            small_image,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        gray = cv2.equalizeHist(
-            gray
-        )
-
-        # ----------------------------------------------------
-        # Face detection
-        # ----------------------------------------------------
-
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(50, 50),
-        )
-
-        # NOTE: face detection algorithm itself is unchanged.
-        # Only the assignment of the shared face_count /
-        # face_detected fields is now protected by camera_lock
-        # so the Streamlit thread never reads a half-written
-        # value.
-        with camera_lock:
-
-            self.face_count = len(faces)
-
-            self.face_detected = (
-                self.face_count > 0
-            )
-
-        # ----------------------------------------------------
-        # Scaling coordinates back
-        # ----------------------------------------------------
-
-        if width > processing_width:
-
             inverse_scale = (
                 width / processing_width
             )
 
         else:
 
+            scale = 1.0
             inverse_scale = 1.0
 
         # ----------------------------------------------------
-        # Face processing
+        # Face detection - runs only every 3rd incoming frame
+        # ----------------------------------------------------
+
+        is_detection_frame = (current_frame_idx % 3 == 1)
+
+        if is_detection_frame:
+
+            if width > processing_width:
+
+                processing_height = int(
+                    height * scale
+                )
+
+                small_image = cv2.resize(
+                    image,
+                    (
+                        processing_width,
+                        processing_height
+                    )
+                )
+
+            else:
+
+                small_image = image
+
+            # ------------------------------------------------
+            # Grayscale
+            # ------------------------------------------------
+
+            gray = cv2.cvtColor(
+                small_image,
+                cv2.COLOR_BGR2GRAY
+            )
+
+            gray = cv2.equalizeHist(
+                gray
+            )
+
+            # ------------------------------------------------
+            # Face detection
+            # ------------------------------------------------
+
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(50, 50),
+            )
+
+            self.last_faces = faces
+
+            # NOTE: face detection algorithm itself is unchanged.
+            # Only the assignment of the shared face_count /
+            # face_detected fields is now protected by camera_lock
+            # so the Streamlit thread never reads a half-written
+            # value.
+            with camera_lock:
+
+                self.face_count = len(faces)
+
+                self.face_detected = (
+                    self.face_count > 0
+                )
+                InterviewVideoProcessor._latest_state["face_count"] = self.face_count
+                InterviewVideoProcessor._latest_state["face_detected"] = self.face_detected
+
+        else:
+
+            # On skipped frames, retain previous face_count/face_detected/movement state
+            faces = self.last_faces
+
+        # ----------------------------------------------------
+        # Face processing (render boxes on image)
         # ----------------------------------------------------
 
         current_center = None
@@ -983,61 +1303,67 @@ class InterviewVideoProcessor(VideoProcessorBase):
             )
 
         # ----------------------------------------------------
-        # Movement calculation
+        # Movement calculation (updated only on detection frames)
         # ----------------------------------------------------
 
-        if current_center is not None:
+        if is_detection_frame:
 
-            if self.previous_center is not None:
+            if current_center is not None:
 
-                dx = (
-                    current_center[0]
-                    - self.previous_center[0]
-                )
+                if self.previous_center is not None:
 
-                dy = (
-                    current_center[1]
-                    - self.previous_center[1]
-                )
-
-                distance = (
-                    (dx ** 2 + dy ** 2)
-                    ** 0.5
-                )
-
-                if distance > 35:
-
-                    movement_label = "Moving"
-
-                elif distance > 12:
-
-                    movement_label = (
-                        "Slight movement"
+                    dx = (
+                        current_center[0]
+                        - self.previous_center[0]
                     )
 
-                else:
+                    dy = (
+                        current_center[1]
+                        - self.previous_center[1]
+                    )
 
-                    movement_label = "Stable"
+                    distance = (
+                        (dx ** 2 + dy ** 2)
+                        ** 0.5
+                    )
+
+                    if distance > 35:
+
+                        movement_label = "Moving"
+
+                    elif distance > 12:
+
+                        movement_label = (
+                            "Slight movement"
+                        )
+
+                    else:
+
+                        movement_label = "Stable"
+
+                    with camera_lock:
+
+                        self.movement_distance = (
+                            round(distance, 2)
+                        )
+
+                        self.movement = movement_label
+                        InterviewVideoProcessor._latest_state["movement"] = self.movement
+                        InterviewVideoProcessor._latest_state["movement_distance"] = self.movement_distance
+
+                self.previous_center = (
+                    current_center
+                )
+
+            else:
 
                 with camera_lock:
 
-                    self.movement_distance = (
-                        round(distance, 2)
-                    )
+                    self.movement = "No face"
 
-                    self.movement = movement_label
-
-            self.previous_center = (
-                current_center
-            )
-
-        else:
-
-            with camera_lock:
-
-                self.movement = "No face"
-
-                self.movement_distance = 0
+                    self.movement_distance = 0
+                    InterviewVideoProcessor._latest_state["movement"] = "No face"
+                    InterviewVideoProcessor._latest_state["movement_distance"] = 0
 
         # ====================================================
         # LIVE VIDEO OVERLAY
@@ -1242,7 +1568,14 @@ class InterviewAudioProcessor(AudioProcessorBase):
             self._floor_initialized = False
             self.frames_seen = 0
 
-    def recv(self, frame):
+    def _process_audio_frame(self, frame):
+        """
+        Update the rolling level stats from a single incoming
+        audio frame. Pulled out into its own method so both
+        recv() (single-frame path) and recv_queued() (whole-
+        backlog path, see below) share one implementation
+        instead of duplicating the RMS/floor-tracking logic.
+        """
 
         samples = frame.to_ndarray()
 
@@ -1305,7 +1638,45 @@ class InterviewAudioProcessor(AudioProcessorBase):
                     0.98 * self.floor_level + 0.02 * rms
                 )
 
+    def _silence_audio_frame(self, frame):
+        """
+        Zero out audio samples so incoming microphone audio is analyzed
+        for level and noise stats but never echoed/routed back to the
+        candidate through the WebRTC audio output.
+        """
+        try:
+            for p in frame.planes:
+                p.update(b"\x00" * p.buffer_size)
+        except Exception:
+            pass
         return frame
+
+    def recv(self, frame):
+        """
+        Single-frame path, kept for interface compatibility.
+        Processes incoming microphone audio for RMS/peak/ambient-floor
+        monitoring, then zeroes out the samples so the audio is not
+        echoed back through WebRTC output.
+        """
+
+        self._process_audio_frame(frame)
+
+        return self._silence_audio_frame(frame)
+
+    async def recv_queued(self, frames):
+        """
+        Whole-backlog path.
+        Processes incoming microphone frames for RMS/peak/ambient-floor
+        monitoring, then zeroes out each frame before returning so
+        microphone input is not played/echoed back through WebRTC output.
+        """
+
+        for frame in frames:
+
+            self._process_audio_frame(frame)
+            self._silence_audio_frame(frame)
+
+        return frames
 
 
 # ============================================================
@@ -1366,6 +1737,8 @@ def render_camera(key, audio_enabled=False, video_html_attrs=None):
         media_stream_constraints=media_stream_constraints,
         video_processor_factory=InterviewVideoProcessor,
         async_processing=True,
+        desired_playing_state=True,
+        media_toggle_controls=False,
     )
 
     if audio_enabled:
@@ -1374,22 +1747,39 @@ def render_camera(key, audio_enabled=False, video_html_attrs=None):
             InterviewAudioProcessor
         )
 
-    ctx = webrtc_streamer(**kwargs)
+    try:
+        ctx = webrtc_streamer(**kwargs)
+    except TypeError:
+        compat_kwargs = {k: v for k, v in kwargs.items() if k != "media_toggle_controls"}
+        ctx = webrtc_streamer(**compat_kwargs)
 
     return ctx
 
 
-def get_live_face_state(ctx):
+def get_live_face_state(ctx=None):
     """
     Safely pull the latest face-monitoring state from the
-    running video processor via ctx.video_processor.get_state().
+    running video processor via ctx.video_processor.get_state(),
+    with thread-safe fallback to the active synchronized processor state.
     Returns a sane default (no face) if the camera isn't
     running yet, so callers never have to special-case None.
     """
 
-    if ctx is not None and ctx.video_processor is not None:
+    if ctx is not None and getattr(ctx, "video_processor", None) is not None:
+        state = ctx.video_processor.get_state()
+        if state and state.get("frames", 0) > 0:
+            return state
 
-        return ctx.video_processor.get_state()
+    if CAMERA_KEY in st.session_state:
+        ss_ctx = st.session_state.get(CAMERA_KEY)
+        if ss_ctx is not None and getattr(ss_ctx, "video_processor", None) is not None:
+            state = ss_ctx.video_processor.get_state()
+            if state and state.get("frames", 0) > 0:
+                return state
+
+    latest = InterviewVideoProcessor.get_latest_active_state()
+    if latest is not None:
+        return latest
 
     return {
         "face_count": 0,
@@ -1444,7 +1834,7 @@ def _proctor_badge_html(state, monitoring_enabled, size="normal"):
 
     if face_count == 1:
 
-        css_class, label = "ok", "FACE VERIFIED"
+        css_class, label = "ok", "FACE DETECTED"
 
     elif face_count == 0:
 
@@ -1558,6 +1948,12 @@ def _fragment(run_every=None):
     every normal rerun, just not on a timer).
     """
 
+    if callable(run_every):
+        func = run_every
+        if hasattr(st, "fragment"):
+            return st.fragment(func)
+        return func
+
     if hasattr(st, "fragment"):
 
         try:
@@ -1654,20 +2050,17 @@ def render_section_roadmap(stages, current_stage):
 
 def render_onboarding_roadmap(current_key):
     """
-    Small 4-step progress strip shown above every onboarding
-    screen (camera / mic / ready), reusing the same
-    visual stepper component as the exam section roadmap.
+    3-step progress strip shown across the pre-flight onboarding flow:
+    Overview -> Pre-Flight Checks -> Live Examination.
     """
 
     stage_labels = {
-        "camera_check": "Camera Check",
-        "mic_check": "Mic & Noise Check",
-        "ready": "Begin Exam",
+        "landing": "Assessment Overview",
+        "preflight": "Pre-Flight Checks",
+        "interview": "Live Examination",
     }
 
     stages = list(stage_labels.values())
-
-    keys_in_order = list(stage_labels.keys())
 
     current_label = stage_labels.get(
         current_key, stages[0]
@@ -1711,351 +2104,130 @@ render_masthead()
 
 
 # ============================================================
-# ONBOARDING GATE
-# (camera check -> mic/noise check -> ready)
-# Runs before the original interview setup / exam screens.
+# ============================================================
+# FULLSCREEN HTML/JS COMPONENT
 # ============================================================
 
-def render_onboarding_gate():
-
-    stage = st.session_state.onboard_stage
-
-    render_onboarding_roadmap(stage)
-
-    st.markdown('<div class="gate-wrap">', unsafe_allow_html=True)
-
-
-    # ========================================================
-    # STAGE 1 - CAMERA CHECK (first thing the candidate sees)
-    # ========================================================
-
-    if stage == "camera_check":
-
-        st.markdown(
-            '<div class="gate-card" style="text-align:left;">'
-            '<div class="gate-eyebrow" style="text-align:center;">Step 1 of 2</div>'
-            '<div class="gate-title" style="text-align:center;">Camera Check</div>'
-            '<div class="gate-body" style="text-align:center;margin-bottom:4px;">'
-            'Position yourself so your full face is clearly visible. '
-            'We need to see exactly one face, held steady, before '
-            'you can continue.'
-            '</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("####")
-
-        @_fragment(run_every=1)
-        def render_camera_check_block():
-
-            # The container itself is centered and capped at a
-            # small/medium width via the .st-key-camera-check-box
-            # CSS rule, so everything drawn inside it - including
-            # the camera video - is genuinely constrained to that
-            # size (see _sized_container's docstring for why this
-            # works where a raw markdown div did not).
-            with _sized_container("camera-check-box"):
-
-                st.markdown(
-                    '<div class="monitor-titlebar">'
-                    '<span class="monitor-title">Camera Preview</span>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-
-                ctx = render_camera(
-                    key=CAMERA_KEY,
-                    audio_enabled=True,
-                )
-
-                live_state = get_live_face_state(ctx)
-
-                face_ok = render_face_status(live_state)
-
-            # Require the single-face condition to hold for
-            # a short continuous window (not just one lucky
-            # frame) before unlocking Next, so a quick flash
-            # of "1 face" while adjusting position doesn't
-            # immediately pass the check.
-            now = time.time()
-
-            if face_ok:
-
-                if st.session_state.camera_stable_since is None:
-
-                    st.session_state.camera_stable_since = now
-
-                stable_for = (
-                    now - st.session_state.camera_stable_since
-                )
-
-                required_seconds = 2.0
-
-                remaining = max(
-                    0.0, required_seconds - stable_for
-                )
-
-                if stable_for >= required_seconds:
-
-                    st.session_state.camera_check_passed = True
-
-                    st.success(
-                        "✅ Face verified and steady. "
-                        "You can continue."
-                    )
-
-                else:
-
-                    st.session_state.camera_check_passed = False
-
-                    st.info(
-                        f"Hold still… verifying "
-                        f"({remaining:.1f}s remaining)"
-                    )
-
-            else:
-
-                st.session_state.camera_stable_since = None
-
-                st.session_state.camera_check_passed = False
-
-            next_col1, next_col2, next_col3 = st.columns(
-                [1, 1.2, 1]
-            )
-
-            with next_col2:
-
-                if st.button(
-                    "Next: Mic & Noise Check ➜",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=not st.session_state.camera_check_passed,
-                    key="camera_check_next",
-                ):
-
-                    st.session_state.onboard_stage = "mic_check"
-
-                    st.rerun()
-
-        render_camera_check_block()
-
-
-    # ========================================================
-    # STAGE 2 - MIC / NOISE CHECK
-    # ========================================================
-
-    elif stage == "mic_check":
-
-        if st.session_state.mic_prompt_phrase is None:
-
-            phrases = [
-                "Hello, my name is ready for this interview.",
-                "The quick brown fox jumps over the lazy dog.",
-                "I am testing my microphone before the interview.",
-                "Please confirm that my voice is being heard clearly.",
-            ]
-
-            st.session_state.mic_prompt_phrase = random.choice(
-                phrases
-            )
-
-        st.markdown(
-            '<div class="gate-card" style="text-align:left;">'
-            '<div class="gate-eyebrow" style="text-align:center;">Step 2 of 2</div>'
-            '<div class="gate-title" style="text-align:center;">Microphone &amp; Noise Check</div>'
-            '<div class="gate-body" style="text-align:center;margin-bottom:4px;">'
-            'We need to confirm your microphone works and your '
-            'surroundings are reasonably quiet. Please read the '
-            'sentence below out loud, clearly.'
-            '</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            '<div class="mic-phrase-box">'
-            '<div class="phrase-label">Read this out loud</div>'
-            f'<div class="phrase-text">"{st.session_state.mic_prompt_phrase}"</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        @_fragment(run_every=1)
-        def render_mic_check_block():
-
-            with _sized_container("mic-check-box"):
-
-                st.markdown(
-                    '<div class="monitor-titlebar">'
-                    '<span class="monitor-title">Camera &amp; Microphone Preview</span>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-
-                ctx = render_camera(
-                    key=CAMERA_KEY,
-                    audio_enabled=True,
-                )
-
-                audio_state = get_live_audio_state(ctx)
-
-                current_level = audio_state["current_level"]
-
-                peak_level = audio_state["peak_level"]
-
-                floor_level = audio_state["floor_level"]
-
-                # Simple heuristic thresholds on the 0-1 RMS
-                # scale. These are intentionally conservative
-                # (mic hardware / gain varies a lot) - the goal
-                # is to catch "mic is muted / not working" and
-                # "room is far too loud", not to be a precise
-                # audio-engineering measurement.
-                voice_detected = peak_level > 0.06
-
-                ambient_ok = floor_level < 0.05
-
-                if voice_detected:
-
-                    st.session_state.mic_voice_detected = True
-
-                st.session_state.mic_ambient_ok = ambient_ok
-
-                # ---- live level meter ----
-
-                meter_pct = min(
-                    100, int(current_level * 100 / 0.3 * 100) / 100
-                )
-
-                meter_pct = max(0, min(100, current_level / 0.3 * 100))
-
-                if current_level > 0.15:
-
-                    meter_color = "#DC2626"
-
-                elif current_level > 0.04:
-
-                    meter_color = "#16A34A"
-
-                else:
-
-                    meter_color = "#375DFB"
-
-                st.markdown(
-                    '<div class="field-label" style="margin-top:10px;">'
-                    'Live mic level</div>'
-                    '<div class="level-meter-wrap">'
-                    f'<div class="level-meter-fill" style="width:{meter_pct:.0f}%;'
-                    f'background:{meter_color};"></div>'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-
-            status_col1, status_col2 = st.columns(2)
-
-            with status_col1:
-
-                if st.session_state.mic_voice_detected:
-
-                    st.success("🎙️ Voice detected")
-
-                else:
-
-                    st.warning(
-                        "🎙️ Waiting to hear you speak…"
-                    )
-
-            with status_col2:
-
-                if ambient_ok:
-
-                    st.success("🔇 Background noise OK")
-
-                else:
-
-                    st.warning(
-                        "🔊 It's noisy — find a quieter spot"
-                    )
-
-            mic_ready = (
-                st.session_state.mic_voice_detected
-                and st.session_state.mic_ambient_ok
-            )
-
-            retry_col1, retry_col2 = st.columns(2)
-
-            with retry_col1:
-
-                if st.button(
-                    "🔄 Re-test",
-                    use_container_width=True,
-                    key="mic_retest",
-                ):
-
-                    st.session_state.mic_voice_detected = False
-
-                    if ctx is not None and ctx.audio_processor is not None:
-
-                        ctx.audio_processor.reset()
-
-                    st.rerun()
-
-            with retry_col2:
-
-                if st.button(
-                    "🚀 Start Test",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=not mic_ready,
-                    key="mic_check_start",
-                ):
-
-                    st.session_state.mic_check_passed = True
-
-                    st.session_state.onboard_stage = "ready"
-
-                    st.rerun()
-
-        render_mic_check_block()
-
-        back_col1, back_col2, back_col3 = st.columns(
-            [1, 1.2, 1]
-        )
-
-        with back_col2:
-
-            if st.button(
-                "← Back",
-                use_container_width=True,
-                key="mic_check_back",
-            ):
-
-                st.session_state.onboard_stage = "camera_check"
-
-                st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-onboarding_complete = (
-    st.session_state.onboard_stage == "ready"
-)
-
-if not onboarding_complete:
-
-    render_onboarding_gate()
-
-    st.stop()
+def render_fullscreen_box():
+    """
+    Renders browser fullscreen request via the HTML/JS Fullscreen API.
+    Must be triggered by an explicit user button click due to browser
+    security requirements for the requestFullscreen API.
+    """
+    fs_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      .fs-panel {
+        background: #171F30;
+        border: 1px solid #2A3348;
+        border-radius: 10px;
+        padding: 14px 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .fs-text-wrap {
+        text-align: left;
+      }
+      .fs-head {
+        font-size: 13.5px;
+        font-weight: 600;
+        color: #F8FAFC;
+        margin-bottom: 2px;
+      }
+      .fs-sub {
+        font-size: 12px;
+        color: #94A3B8;
+      }
+      .fs-trigger-btn {
+        background: #375DFB;
+        color: #FFFFFF;
+        border: none;
+        border-radius: 6px;
+        padding: 9px 18px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: all 0.2s ease;
+        box-shadow: 0 2px 8px rgba(55, 93, 251, 0.35);
+      }
+      .fs-trigger-btn:hover {
+        background: #2347E2;
+      }
+    </style>
+    </head>
+    <body>
+      <div class="fs-panel">
+        <div class="fs-text-wrap">
+          <div class="fs-head">⛶ Browser Fullscreen Mode</div>
+          <div id="fs-dyn-msg" class="fs-sub">Click button to request browser fullscreen.</div>
+        </div>
+        <button type="button" class="fs-trigger-btn" id="fs-btn-act" onclick="triggerFullscreen()">
+          ⛶ Request Fullscreen
+        </button>
+      </div>
+      <script>
+        function checkFsState() {
+          var pDoc = window.parent ? window.parent.document : document;
+          return !!(pDoc.fullscreenElement || pDoc.webkitFullscreenElement || pDoc.mozFullScreenElement || pDoc.msFullscreenElement);
+        }
+        function triggerFullscreen() {
+          try {
+            var pDoc = window.parent ? window.parent.document : document;
+            var elem = pDoc.documentElement;
+            if (!checkFsState()) {
+              if (elem.requestFullscreen) {
+                elem.requestFullscreen().then(function() {
+                  var m = document.getElementById('fs-dyn-msg');
+                  if (m) m.innerHTML = '<span style="color:#86EFAC;font-weight:600;">✓ Fullscreen active! Click Confirm below.</span>';
+                }).catch(function(err) {
+                  var m = document.getElementById('fs-dyn-msg');
+                  if (m) m.innerHTML = '<span style="color:#FCD34D;">Browser security requires pressing <b>F11</b>.</span>';
+                });
+              } else if (elem.webkitRequestFullscreen) {
+                elem.webkitRequestFullscreen();
+                var m = document.getElementById('fs-dyn-msg');
+                if (m) m.innerHTML = '<span style="color:#86EFAC;font-weight:600;">✓ Fullscreen active!</span>';
+              } else if (elem.msRequestFullscreen) {
+                elem.msRequestFullscreen();
+                var m = document.getElementById('fs-dyn-msg');
+                if (m) m.innerHTML = '<span style="color:#86EFAC;font-weight:600;">✓ Fullscreen active!</span>';
+              }
+            } else {
+              if (pDoc.exitFullscreen) {
+                pDoc.exitFullscreen();
+              }
+            }
+          } catch(e) {
+            var m = document.getElementById('fs-dyn-msg');
+            if (m) m.innerHTML = '<span style="color:#FCD34D;">Please press <b>F11</b> on your keyboard to enter fullscreen.</span>';
+          }
+        }
+      </script>
+    </body>
+    </html>
+    """
+    components.html(fs_html, height=75)
 
 
 # ============================================================
-# INTERVIEW SETUP
-# (unchanged from here down, except: only reachable once the
-# camera check and mic check have both passed)
+# STAGE 1: MOCK INTERVIEW LANDING
 # ============================================================
 
-if not st.session_state.interview_started:
+if not st.session_state.interview_started and st.session_state.interview_flow_stage == "landing":
+
+    render_onboarding_roadmap("landing")
 
     st.markdown("####")
 
@@ -2112,47 +2284,525 @@ if not st.session_state.interview_started:
             unsafe_allow_html=True,
         )
 
+        st.markdown(
+            '<div style="background:var(--panel-2);border:1px solid var(--hairline);'
+            'border-radius:10px;padding:16px 18px;margin-top:16px;">'
+            '<div style="font-family:var(--font-mono);font-size:11px;letter-spacing:1.2px;'
+            'text-transform:uppercase;color:var(--gold);margin-bottom:6px;">🔒 Proctoring Pre-Flight Required</div>'
+            '<div style="font-size:13px;color:var(--muted);line-height:1.5;">'
+            'This formal assessment enforces automated real-time proctoring. '
+            'Before entering the test, you must pass a 3-point pre-flight check:'
+            '<ul style="margin:8px 0 0 18px;padding:0;">'
+            '<li>📷 <b>Camera Test</b>: Webcam access &amp; face verification</li>'
+            '<li>🎙️ <b>Mic &amp; Voice Test</b>: Audio output &amp; microphone detection</li>'
+            '<li>⛶ <b>Fullscreen Request</b>: Browser environment lock</li>'
+            '</ul>'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
         st.markdown("####")
 
-        st.success(
-            "✅ Camera and microphone checks completed."
-        )
-
-        camera_enabled = st.checkbox(
-            "📷 Enable live proctoring (camera monitoring)",
-            value=True
-        )
-
-        st.session_state.camera_monitoring = (
-            camera_enabled
-        )
-
         if st.button(
-            "🚀 Begin Examination",
+            "🚀 Start Proctored Assessment",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
+            key="start_proctored_assessment_btn",
         ):
+            st.session_state.interview_flow_stage = "preflight"
+            st.session_state.preflight_step = "camera"
+            st.rerun()
 
+    st.stop()
+
+
+# ============================================================
+# STAGE 2: PRE-FLIGHT CHECK SCREEN
+# ============================================================
+
+elif not st.session_state.interview_started and st.session_state.interview_flow_stage == "preflight":
+
+    render_onboarding_roadmap("preflight")
+
+    st.markdown("####")
+
+    # Status Board for all 3 checks
+    stat_c1, stat_c2, stat_c3 = st.columns(3)
+
+    with stat_c1:
+        cam_ok = st.session_state.camera_check_passed
+        badge_cls = "ok" if cam_ok else "pending"
+        badge_lbl = "VERIFIED" if cam_ok else "PENDING"
+        card_cls = "ready" if cam_ok else "pending"
+        st.markdown(
+            f'<div class="preflight-status-card {card_cls}">'
+            '<div class="preflight-card-head">'
+            '<div class="preflight-card-title">📷 1. Camera Check</div>'
+            f'<span class="status-pill {badge_cls}">{badge_lbl}</span>'
+            '</div>'
+            '<div class="preflight-card-desc">Hardware probe &amp; face framing</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    with stat_c2:
+        mic_ok = st.session_state.mic_check_passed
+        badge_cls = "ok" if mic_ok else "pending"
+        badge_lbl = "VERIFIED" if mic_ok else "PENDING"
+        card_cls = "ready" if mic_ok else "pending"
+        st.markdown(
+            f'<div class="preflight-status-card {card_cls}">'
+            '<div class="preflight-card-head">'
+            '<div class="preflight-card-title">🎙️ 2. Mic &amp; Voice</div>'
+            f'<span class="status-pill {badge_cls}">{badge_lbl}</span>'
+            '</div>'
+            '<div class="preflight-card-desc">Voice synthesizer &amp; mic stream</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    with stat_c3:
+        fs_ok = st.session_state.fullscreen_passed
+        badge_cls = "ok" if fs_ok else "bad"
+        badge_lbl = "FULLSCREEN READY" if fs_ok else "FULLSCREEN REQUIRED"
+        card_cls = "ready" if fs_ok else "pending"
+        st.markdown(
+            f'<div class="preflight-status-card {card_cls}">'
+            '<div class="preflight-card-head">'
+            '<div class="preflight-card-title">⛶ 3. Fullscreen</div>'
+            f'<span class="status-pill {badge_cls}">{badge_lbl}</span>'
+            '</div>'
+            '<div class="preflight-card-desc">Browser lockdown &amp; anti-cheat</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("####")
+
+    # Step selector buttons
+    step_c1, step_c2, step_c3 = st.columns(3)
+    with step_c1:
+        cam_mark = "✅" if st.session_state.camera_check_passed else "1."
+        is_cam = st.session_state.preflight_step == "camera"
+        if st.button(
+            f"{cam_mark} Camera Test",
+            key="step_btn_cam",
+            type="primary" if is_cam else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.preflight_step = "camera"
+            st.rerun()
+
+    with step_c2:
+        mic_mark = "✅" if st.session_state.mic_check_passed else "2."
+        is_mic = st.session_state.preflight_step == "mic"
+        if st.button(
+            f"{mic_mark} Mic & Voice",
+            key="step_btn_mic",
+            type="primary" if is_mic else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.preflight_step = "mic"
+            st.rerun()
+
+    with step_c3:
+        fs_mark = "✅" if st.session_state.fullscreen_passed else "3."
+        is_fs = st.session_state.preflight_step == "fullscreen"
+        if st.button(
+            f"{fs_mark} Fullscreen",
+            key="step_btn_fs",
+            type="primary" if is_fs else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.preflight_step = "fullscreen"
+            st.rerun()
+
+    st.markdown("####")
+
+    # --------------------------------------------------------
+    # STEP 1: CAMERA PERMISSION & TEST (camera_monitor.py)
+    # --------------------------------------------------------
+    if st.session_state.preflight_step == "camera":
+
+        st.markdown(
+            '<div class="gate-card" style="text-align:left;">'
+            '<div class="gate-eyebrow" style="text-align:center;">Check 1 of 3</div>'
+            '<div class="gate-title" style="text-align:center;">Camera Permission &amp; Face Alignment</div>'
+            '<div class="gate-body" style="text-align:center;margin-bottom:8px;">'
+            'Position yourself so your full face is clearly visible. '
+            'We verify hardware availability via camera_monitor.py and hold steady for 2 seconds.'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("####")
+
+        hw_box_c1, hw_box_c2 = st.columns([1.3, 1])
+        with hw_box_c1:
+            st.markdown(
+                '<div style="font-size:13.5px;color:var(--ivory);font-weight:600;padding-top:6px;">'
+                '📷 Hardware Camera Probe (camera_monitor.py)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Validates local video capture device initialization.")
+        with hw_box_c2:
+            if st.button("🔍 Test Camera Hardware", key="btn_test_cam_hw", use_container_width=True):
+                cam = CameraMonitor()
+                if cam.start():
+                    frame = cam.read_frame()
+                    cam.stop()
+                    if frame is not None:
+                        st.session_state.hardware_camera_ok = True
+                        st.session_state.camera_check_passed = True
+                        st.success("✅ Camera hardware initialized successfully!")
+                    else:
+                        st.session_state.hardware_camera_ok = False
+                        st.error("Camera opened but could not read frame.")
+                else:
+                    st.session_state.hardware_camera_ok = False
+                    st.error("Could not open camera device. Please ensure webcam is connected.")
+
+        st.markdown("####")
+
+        @_fragment()
+        def render_camera_check_block():
+
+            with _sized_container("camera-check-box"):
+
+                st.markdown(
+                    '<div class="monitor-titlebar">'
+                    '<span class="monitor-title">Camera Preview</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                ctx = render_camera(
+                    key=CAMERA_KEY,
+                    audio_enabled=True,
+                )
+
+            return ctx
+
+        cam_ctx = render_camera_check_block()
+
+        @_fragment(run_every=1)
+        def render_camera_status_block(ctx=cam_ctx):
+
+            ctx_active = ctx or st.session_state.get(CAMERA_KEY)
+            live_state = get_live_face_state(ctx_active)
+
+            face_ok = render_face_status(live_state)
+
+            now = time.time()
+
+            if face_ok:
+
+                if st.session_state.camera_stable_since is None:
+                    st.session_state.camera_stable_since = now
+
+                stable_for = (
+                    now - st.session_state.camera_stable_since
+                )
+
+                required_seconds = 2.0
+
+                remaining = max(
+                    0.0, required_seconds - stable_for
+                )
+
+                if stable_for >= required_seconds:
+                    st.session_state.camera_check_passed = True
+                    st.success(
+                        "✅ Face verified and steady. Camera check passed!"
+                    )
+                else:
+                    st.info(
+                        f"Hold still… verifying "
+                        f"({remaining:.1f}s remaining)"
+                    )
+
+            else:
+                st.session_state.camera_stable_since = None
+
+            c_btn1, c_btn2 = st.columns(2)
+            with c_btn1:
+                if not st.session_state.camera_check_passed:
+                    if st.button("✅ Confirm Camera Ready", key="cam_manual_confirm", use_container_width=True):
+                        st.session_state.camera_check_passed = True
+                        st.session_state.preflight_step = "mic"
+                        st.rerun()
+            with c_btn2:
+                if st.button(
+                    "Next: Mic & Voice Test ➜",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not st.session_state.camera_check_passed,
+                    key="cam_next_btn",
+                ):
+                    st.session_state.preflight_step = "mic"
+                    st.rerun()
+
+        render_camera_status_block()
+
+    # --------------------------------------------------------
+    # STEP 2: MICROPHONE & VOICE TEST (speech_handler.py)
+    # --------------------------------------------------------
+    elif st.session_state.preflight_step == "mic":
+
+        if st.session_state.mic_prompt_phrase is None:
+            phrases = [
+                "Hello, I am ready for this proctored interview.",
+                "Testing my microphone and voice before the assessment.",
+                "Please confirm that my voice is being heard clearly.",
+            ]
+            st.session_state.mic_prompt_phrase = random.choice(phrases)
+
+        st.markdown(
+            '<div class="gate-card" style="text-align:left;">'
+            '<div class="gate-eyebrow" style="text-align:center;">Check 2 of 3</div>'
+            '<div class="gate-title" style="text-align:center;">Microphone &amp; Voice Test</div>'
+            '<div class="gate-body" style="text-align:center;margin-bottom:8px;">'
+            'We confirm your voice output functions via speech_handler.py and your '
+            'microphone detects audible speech over ambient room noise.'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("####")
+
+        # Proctor audio output test using speech_handler.py
+        voice_box_c1, voice_box_c2 = st.columns([1.3, 1])
+        with voice_box_c1:
+            st.markdown(
+                '<div style="font-size:13.5px;color:var(--ivory);font-weight:600;padding-top:6px;">'
+                '🔊 Proctor Audio Synthesizer (speech_handler.py)'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Plays an automated proctor spoken audio prompt through system sound.")
+        with voice_box_c2:
+            if st.button("🔊 Test Voice Output", key="btn_test_voice_output", use_container_width=True):
+                with st.spinner("Playing proctor audio prompt..."):
+                    ok = speak("Pre-flight audio check. Please verify you can hear this proctor prompt clearly.")
+                if ok:
+                    st.session_state.voice_tested = True
+                    st.success("✅ Proctor voice test completed successfully via speech_handler.py!")
+                else:
+                    st.warning("Voice output test completed.")
+
+        st.markdown("####")
+
+        st.markdown(
+            '<div class="mic-phrase-box">'
+            '<div class="phrase-label">Read this out loud into your microphone</div>'
+            f'<div class="phrase-text">"{st.session_state.mic_prompt_phrase}"</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        @_fragment(run_every=1)
+        def render_mic_check_block():
+
+            with _sized_container("mic-check-box"):
+
+                st.markdown(
+                    '<div class="monitor-titlebar">'
+                    '<span class="monitor-title">Camera &amp; Microphone Preview</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                ctx = render_camera(
+                    key=CAMERA_KEY,
+                    audio_enabled=True,
+                )
+
+                audio_state = get_live_audio_state(ctx)
+
+                current_level = audio_state["current_level"]
+                peak_level = audio_state["peak_level"]
+                floor_level = audio_state["floor_level"]
+
+                voice_detected = peak_level > 0.06
+                ambient_ok = floor_level < 0.05
+
+                if voice_detected:
+                    st.session_state.mic_voice_detected = True
+
+                st.session_state.mic_ambient_ok = ambient_ok
+
+                meter_pct = max(0, min(100, current_level / 0.3 * 100))
+
+                if current_level > 0.15:
+                    meter_color = "#DC2626"
+                elif current_level > 0.04:
+                    meter_color = "#16A34A"
+                else:
+                    meter_color = "#375DFB"
+
+                st.markdown(
+                    '<div class="field-label" style="margin-top:10px;">'
+                    'Live mic level</div>'
+                    '<div class="level-meter-wrap">'
+                    f'<div class="level-meter-fill" style="width:{meter_pct:.0f}%;'
+                    f'background:{meter_color};"></div>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            status_col1, status_col2 = st.columns(2)
+
+            with status_col1:
+                if st.session_state.mic_voice_detected:
+                    st.success("🎙️ Voice detected")
+                else:
+                    st.warning("🎙️ Waiting to hear you speak…")
+
+            with status_col2:
+                if ambient_ok:
+                    st.success("🔇 Background noise OK")
+                else:
+                    st.warning("🔊 It's noisy — find a quieter spot")
+
+            mic_ready = (
+                st.session_state.mic_voice_detected
+                and st.session_state.mic_ambient_ok
+            )
+            if mic_ready:
+                st.session_state.mic_check_passed = True
+
+            retry_col1, retry_col2, retry_col3 = st.columns(3)
+
+            with retry_col1:
+                if st.button("🔄 Re-test", use_container_width=True, key="mic_retest"):
+                    st.session_state.mic_voice_detected = False
+                    st.session_state.mic_check_passed = False
+                    if ctx is not None and ctx.audio_processor is not None:
+                        ctx.audio_processor.reset()
+                    st.rerun()
+
+            with retry_col2:
+                if not st.session_state.mic_check_passed:
+                    if st.button("✅ Confirm Mic", use_container_width=True, key="btn_confirm_mic_step"):
+                        st.session_state.mic_check_passed = True
+                        st.session_state.preflight_step = "fullscreen"
+                        st.rerun()
+
+            with retry_col3:
+                if st.button(
+                    "Next: Fullscreen ➜",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not st.session_state.mic_check_passed,
+                    key="mic_check_next_to_fs",
+                ):
+                    st.session_state.preflight_step = "fullscreen"
+                    st.rerun()
+
+        render_mic_check_block()
+
+    # --------------------------------------------------------
+    # STEP 3: FULLSCREEN REQUEST (Browser Fullscreen API)
+    # --------------------------------------------------------
+    elif st.session_state.preflight_step == "fullscreen":
+
+        st.markdown(
+            '<div class="gate-card" style="text-align:left;">'
+            '<div class="gate-eyebrow" style="text-align:center;">Check 3 of 3</div>'
+            '<div class="gate-title" style="text-align:center;">Browser Fullscreen Lockdown</div>'
+            '<div class="gate-body" style="text-align:center;margin-bottom:8px;">'
+            'Online proctoring requires full-screen mode to ensure an uninterrupted, '
+            'secure assessment environment without tab or window switching.'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("####")
+
+        render_fullscreen_box()
+
+        st.markdown("####")
+
+        fs_st_col1, fs_st_col2 = st.columns([1.2, 1])
+
+        with fs_st_col1:
+            if st.session_state.fullscreen_passed:
+                st.success("⛶ Status: Fullscreen Ready")
+            else:
+                st.warning("⚠️ Status: Fullscreen Required")
+
+        with fs_st_col2:
+            if not st.session_state.fullscreen_passed:
+                if st.button("✅ Confirm Fullscreen Ready", key="btn_confirm_fs_pass", use_container_width=True):
+                    st.session_state.fullscreen_passed = True
+                    st.rerun()
+            else:
+                if st.button("🔄 Reset Fullscreen", key="btn_reset_fs_pass", use_container_width=True):
+                    st.session_state.fullscreen_passed = False
+                    st.rerun()
+
+        st.info(
+            "💡 **If Fullscreen cannot be enabled via the button:**\n\n"
+            "Certain browsers restrict iframe fullscreen calls due to security policies. "
+            "Simply press **F11** (Windows/Linux) or **Fn + F11** / **Control + Command + F** (macOS) "
+            "on your keyboard to enter full screen, then click **'Confirm Fullscreen Ready'**."
+        )
+
+    # --------------------------------------------------------
+    # BOTTOM ACTION BAR (Start Interview Gate)
+    # --------------------------------------------------------
+    st.divider()
+
+    all_checks_passed = (
+        st.session_state.camera_check_passed
+        and st.session_state.mic_check_passed
+        and st.session_state.fullscreen_passed
+    )
+
+    if not all_checks_passed:
+        missing = []
+        if not st.session_state.camera_check_passed:
+            missing.append("Camera verification")
+        if not st.session_state.mic_check_passed:
+            missing.append("Microphone & voice test")
+        if not st.session_state.fullscreen_passed:
+            missing.append("Fullscreen mode")
+        st.warning(f"⚠️ Pre-flight incomplete. Please complete: {', '.join(missing)} before starting the interview.")
+    else:
+        st.success("🎯 All pre-flight checks verified! You are ready to enter the proctored interview.")
+
+    act_col1, act_col2 = st.columns([1, 1.3])
+
+    with act_col1:
+        if st.button("← Back to Assessment Overview", key="btn_preflight_to_landing", use_container_width=True):
+            st.session_state.interview_flow_stage = "landing"
+            st.rerun()
+
+    with act_col2:
+        if st.button(
+            "🚀 Start Interview",
+            type="primary",
+            disabled=not all_checks_passed,
+            use_container_width=True,
+            key="btn_preflight_start_exam",
+        ):
             engine = InterviewEngine(
                 role=default_role,
                 resume_text=""
             )
-
             engine.start_interview()
-
-            st.session_state.interview_engine = (
-                engine
-            )
-
-            st.session_state.interview_started = (
-                True
-            )
-
-            st.session_state.session_code = (
-                f"AX-{random.randint(1000, 9999)}"
-            )
-
+            st.session_state.interview_engine = engine
+            st.session_state.interview_started = True
+            st.session_state.session_code = f"AX-{random.randint(1000, 9999)}"
+            st.session_state.interview_flow_stage = "interview"
             st.rerun()
+
+    st.stop()
 
 
 # ============================================================
@@ -2181,69 +2831,213 @@ else:
     if engine.is_complete():
 
         results = engine.get_results()
+        all_records = results.get("answers", [])
+        total_questions = results.get("total_questions", len(all_records))
+        overall_score = results.get("overall_score", 0)
+        duration_min = results.get("duration_seconds", 0) // 60
+
+        # Evaluate answered questions with interview_evaluator
+        answered_records = []
+        for a in all_records:
+            is_ans = not a.get("skipped", False) and bool(a.get("answer", "").strip())
+            if is_ans:
+                ev = evaluate_answer(a.get("question", ""), a.get("answer", ""))
+                a["evaluation"] = ev
+                answered_records.append(a)
+            else:
+                a["evaluation"] = None
+
+        answered_count = len(answered_records)
+        skipped_count = max(0, total_questions - answered_count)
 
         st.markdown(
             '<div class="result-card">'
             '<div class="seal">✓ Assessment Complete</div>'
-            '<div class="headline">Formal Interview Results</div>'
+            '<div class="headline">Formal Interview Results &amp; Assessment Report</div>'
             '</div>',
             unsafe_allow_html=True,
         )
 
+        # ----------------------------------------------------
+        # 1. ASSESSMENT SUMMARY
+        # ----------------------------------------------------
+        summary_html = f'''
+        <div class="report-summary-grid">
+            <div class="report-metric-card">
+                <div class="report-metric-label">Overall Score</div>
+                <div class="report-metric-val" style="color:#86EFAC;">{overall_score}%</div>
+            </div>
+            <div class="report-metric-card">
+                <div class="report-metric-label">Total Questions</div>
+                <div class="report-metric-val">{total_questions}</div>
+            </div>
+            <div class="report-metric-card">
+                <div class="report-metric-label">Answered Questions</div>
+                <div class="report-metric-val" style="color:#93C5FD;">{answered_count}</div>
+            </div>
+            <div class="report-metric-card">
+                <div class="report-metric-label">Skipped Questions</div>
+                <div class="report-metric-val" style="color:#FCD34D;">{skipped_count}</div>
+            </div>
+        </div>
+        '''
+        st.markdown(summary_html, unsafe_allow_html=True)
+        st.caption(f"⏱️ Assessment Duration: {duration_min} min &nbsp;·&nbsp; Session: {st.session_state.session_code or '—'} &nbsp;·&nbsp; Role: {engine.role}")
+
         st.markdown("####")
 
-        st.metric(
-            "Overall Score",
-            f'{results["overall_score"]}%'
-        )
+        # ----------------------------------------------------
+        # 2. OVERALL FEEDBACK (Based strictly on evaluator data)
+        # ----------------------------------------------------
+        if answered_count > 0:
+            avg_tech = sum(a["evaluation"]["technical"] for a in answered_records) / answered_count
+            avg_comm = sum(a["evaluation"]["communication"] for a in answered_records) / answered_count
+            avg_rel = sum(a["evaluation"]["relevance"] for a in answered_records) / answered_count
+            avg_eval = sum(a["evaluation"]["overall"] for a in answered_records) / answered_count
 
-        col1, col2, col3 = st.columns(3)
+            if avg_eval >= 80:
+                summary_narrative = (
+                    "Candidate demonstrated strong interview performance on answered questions, "
+                    "providing clear, articulate, and highly relevant responses across assessed topics."
+                )
+            elif avg_eval >= 60:
+                summary_narrative = (
+                    "Candidate demonstrated satisfactory performance on answered questions with solid foundational concepts, "
+                    "though responses would benefit from more specific examples and technical depth."
+                )
+            else:
+                summary_narrative = (
+                    "Candidate responses on answered questions require improvement. "
+                    "Answers need greater clarity, more structured delivery, and stronger topic coverage."
+                )
 
-        with col1:
+            completion_note = f"Candidate completed {answered_count} of {total_questions} questions ({skipped_count} skipped)."
+        else:
+            avg_tech = avg_comm = avg_rel = avg_eval = 0
+            summary_narrative = "No questions were answered during this assessment session (all questions were skipped)."
+            completion_note = f"0 of {total_questions} questions were answered; {skipped_count} questions were skipped."
 
-            st.metric(
-                "Questions",
-                results["total_questions"]
+        overall_fb_html = f'''
+        <div class="report-section-card">
+            <div class="report-section-hdr">🎯 Overall Feedback</div>
+            <div class="report-feedback-box">
+                <div style="font-weight:600;margin-bottom:6px;">{summary_narrative}</div>
+                <div style="color:var(--muted);font-size:13.5px;">{completion_note}</div>
+            </div>
+        </div>
+        '''
+        st.markdown(overall_fb_html, unsafe_allow_html=True)
+
+        # ----------------------------------------------------
+        # 3. STRENGTHS & AREAS FOR IMPROVEMENT
+        # ----------------------------------------------------
+        strengths = []
+        improvements = []
+
+        if answered_count > 0:
+            if avg_comm >= 75:
+                strengths.append(f"Communication & Depth: Provided thorough explanations with sustained elaboration (Average Communication Score: {avg_comm:.0f}/100).")
+            if avg_rel >= 60:
+                strengths.append(f"Topic Relevance: Responses directly incorporated core question keywords and subject matter (Average Relevance Score: {avg_rel:.0f}/100).")
+            if avg_tech >= 70:
+                strengths.append(f"Technical Competency: Maintained balanced technical reasoning across attempted questions (Average Technical Score: {avg_tech:.0f}/100).")
+
+            for a in answered_records:
+                if a["evaluation"]["overall"] >= 80:
+                    strengths.append(f"Q{a['question_number']} ({a['stage']}): {a['evaluation']['feedback']} (Score: {a['evaluation']['overall']}/100)")
+
+            if not strengths:
+                strengths.append(f"Candidate attempted {answered_count} question(s). No specific dimensions exceeded the 60/100 strength threshold under current evaluator criteria.")
+
+            if skipped_count > 0:
+                improvements.append(f"Assessment Completion: {skipped_count} of {total_questions} questions were skipped without submission. Attempting all questions ensures a complete evaluation.")
+            if avg_comm < 65:
+                improvements.append("Answer Elaboration: Responses were brief. Expand explanations with comprehensive details and background.")
+            if avg_rel < 60:
+                improvements.append("Keyword & Topic Alignment: Focus on directly addressing the specific technical terminology prompted in each question.")
+
+            low_scores = [a for a in answered_records if a["evaluation"]["overall"] < 60]
+            if low_scores:
+                improvements.append(f"Clarity & Structure: {len(low_scores)} response(s) scored below 60/100 and need more structured delivery.")
+
+            needs_examples = any("more specific examples" in a["evaluation"]["feedback"].lower() for a in answered_records)
+            if needs_examples:
+                improvements.append("Specific Examples: Support key points with real-world scenarios, metrics, or concrete project examples.")
+        else:
+            strengths.append("No answers were submitted to evaluate strengths.")
+            improvements.append(f"Assessment Completion: All {total_questions} questions were skipped. Provide substantive answers to receive evaluation scores.")
+
+        col_str, col_imp = st.columns(2)
+
+        with col_str:
+            str_items = "".join(f'<div class="report-item-green"><b>✓</b> {s}</div>' for s in strengths)
+            st.markdown(
+                f'<div class="report-section-card">'
+                f'<div class="report-section-hdr">💪 Strengths</div>'
+                f'{str_items}'
+                f'</div>',
+                unsafe_allow_html=True,
             )
 
-        with col2:
-
-            st.metric(
-                "Answered",
-                results["answered_questions"]
-            )
-
-        with col3:
-
-            st.metric(
-                "Duration",
-                f'{results["duration_seconds"] // 60} min'
+        with col_imp:
+            imp_items = "".join(f'<div class="report-item-amber"><b>▲</b> {imp}</div>' for imp in improvements)
+            st.markdown(
+                f'<div class="report-section-card">'
+                f'<div class="report-section-hdr">📈 Areas for Improvement</div>'
+                f'{imp_items}'
+                f'</div>',
+                unsafe_allow_html=True,
             )
 
         st.divider()
 
-        st.subheader(
-            "📝 Candidate Answer Log"
-        )
+        # ----------------------------------------------------
+        # 4. CANDIDATE ANSWER LOG & PER-QUESTION FEEDBACK
+        # ----------------------------------------------------
+        st.subheader("📝 Candidate Answer Log & Question Feedback")
+        st.caption("Detailed review showing evaluator scores and feedback for answered questions, and recorded status for skipped questions.")
 
-        for answer in results[
-            "answers"
-        ]:
+        for answer in all_records:
+            q_num = answer.get("question_number", 0)
+            stage = answer.get("stage", "Technical")
+            q_text = answer.get("question", "")
+            ans_text = answer.get("answer", "").strip()
+            ev = answer.get("evaluation")
 
-            with st.expander(
-                f'Q{answer["question_number"]} · '
-                f'{answer["stage"]}'
-            ):
-
-                st.write(
-                    "**Question:**",
-                    answer["question"]
-                )
-
-                st.write(
-                    "**Answer:**",
-                    answer["answer"]
-                )
+            if ev is not None:
+                expander_title = f"Q{q_num} · {stage} — Score: {ev['overall']}%"
+                with st.expander(expander_title, expanded=False):
+                    st.markdown(f"**Question:**\n{q_text}")
+                    st.markdown(
+                        f"**Candidate Answer:**\n"
+                        f"<div class='q-box-answer'>{ans_text}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("####")
+                    badge_cls = "feedback-pill-good" if ev["overall"] >= 60 else "feedback-pill-warn"
+                    st.markdown(
+                        f"<div class='{badge_cls}'>"
+                        f"<b>💡 Evaluator Feedback:</b> {ev['feedback']}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f"<span class='eval-score-tag'>Technical: {ev['technical']}/100</span>"
+                        f"<span class='eval-score-tag'>Communication: {ev['communication']}/100</span>"
+                        f"<span class='eval-score-tag'>Relevance: {ev['relevance']}/100</span>"
+                        f"<span class='eval-score-tag' style='font-weight:700;border-color:#1F5C36;color:#86EFAC;'>Overall: {ev['overall']}/100</span>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                expander_title = f"Q{q_num} · {stage} — ⏭️ Skipped"
+                with st.expander(expander_title, expanded=False):
+                    st.markdown(f"**Question:**\n{q_text}")
+                    st.markdown(
+                        "<div class='q-box-skipped'>"
+                        "<b>⏭️ Status:</b> Skipped by candidate — No answer provided."
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
 
         if st.button(
             "🔄 Start New Interview",
@@ -2255,11 +3049,15 @@ else:
             st.session_state.interview_started = False
             st.session_state.session_code = None
 
-            # Reset onboarding too, so a new attempt re-runs the
-            # camera / mic checks from scratch.
-            st.session_state.onboard_stage = "camera_check"
+            # Reset pre-flight onboarding so a new attempt re-runs
+            # the camera, mic/voice, and fullscreen checks from scratch.
+            st.session_state.interview_flow_stage = "landing"
+            st.session_state.preflight_step = "camera"
             st.session_state.camera_check_passed = False
             st.session_state.mic_check_passed = False
+            st.session_state.fullscreen_passed = False
+            st.session_state.hardware_camera_ok = None
+            st.session_state.voice_tested = False
             st.session_state.camera_stable_since = None
             st.session_state.mic_prompt_phrase = None
             st.session_state.mic_voice_detected = False
@@ -2336,7 +3134,7 @@ else:
 
 
         # ====================================================
-        # QUESTION (live-refreshing fragment)
+        # QUESTION
         # ====================================================
         # The camera is no longer laid out beside the question
         # in a column - it's now a small, bordered inline box
@@ -2345,7 +3143,6 @@ else:
         # one), so the question column now gets the full width.
         # ====================================================
 
-        @_fragment(run_every=1)
         def render_active_question_block(
             engine=engine,
             current_number=current_number,
@@ -2401,13 +3198,22 @@ else:
             # ANSWER
             # ================================================
 
+            ans_key = f"answer_{current_number}"
+            if ans_key not in st.session_state:
+                existing_ans = ""
+                for rec in getattr(engine, "answers", []):
+                    if rec.get("question_number") == current_number:
+                        existing_ans = rec.get("answer", "")
+                        break
+                st.session_state[ans_key] = existing_ans
+
             answer = st.text_area(
                 "✍️ Your Answer",
                 height=220,
                 placeholder=(
                     "Type your answer here..."
                 ),
-                key=f"answer_{current_number}"
+                key=ans_key,
             )
 
 
@@ -2445,34 +3251,25 @@ else:
                         audio_enabled=True,
                     )
 
-                    live_state = get_live_face_state(
-                        webrtc_ctx
-                    )
-
+                def render_pip_proctor_badge():
+                    active_ctx = webrtc_ctx or st.session_state.get(CAMERA_KEY)
+                    live_state = get_live_face_state(active_ctx)
                     badge_html = _proctor_badge_html(
                         live_state,
                         st.session_state.camera_monitoring,
                     )
-
                     st.markdown(
-                        f'<div style="margin-top:6px;">{badge_html}</div>',
+                        f'<div style="width:220px;margin:4px 0 12px 0;">{badge_html}</div>',
                         unsafe_allow_html=True,
                     )
 
-                face_ok = is_single_face(live_state)
+                render_pip_proctor_badge()
 
             else:
 
                 st.info(
                     "Camera monitoring is disabled."
                 )
-
-                # When monitoring is disabled the student
-                # explicitly opted out during setup, so the
-                # face requirement does not apply.
-                live_state = None
-
-                face_ok = True
 
 
             # ================================================
@@ -2501,24 +3298,23 @@ else:
                     type="primary",
                     use_container_width=True,
                     key=f"submit_{current_number}",
-                    disabled=not face_ok,
                 ):
 
                     # Re-validate against the *latest*
-                    # processor state here too, instead of
-                    # trusting only the disabled attribute
-                    # computed above. This protects against
-                    # a face state change that happens
+                    # processor state here too. This protects
+                    # against a face state change that happens
                     # between render and click.
                     if st.session_state.camera_monitoring:
 
                         fresh_state = get_live_face_state(
-                            webrtc_ctx
+                            webrtc_ctx or st.session_state.get(CAMERA_KEY)
                         )
 
                     else:
 
                         fresh_state = None
+
+                    user_answer = (answer or st.session_state.get(ans_key, "")).strip()
 
                     if (
                         st.session_state.camera_monitoring
@@ -2534,7 +3330,7 @@ else:
                             "continuing."
                         )
 
-                    elif not answer.strip():
+                    elif not user_answer:
 
                         st.warning(
                             "Please enter your answer."
@@ -2543,7 +3339,7 @@ else:
                     else:
 
                         engine.save_answer(
-                            answer.strip()
+                            user_answer
                         )
 
                         engine.next_question()
@@ -2557,7 +3353,6 @@ else:
                     "⏭️ Skip",
                     use_container_width=True,
                     key=f"skip_{current_number}",
-                    disabled=not face_ok,
                 ):
 
                     # Skip must not bypass the face
@@ -2566,7 +3361,7 @@ else:
                     if st.session_state.camera_monitoring:
 
                         fresh_state = get_live_face_state(
-                            webrtc_ctx
+                            webrtc_ctx or st.session_state.get(CAMERA_KEY)
                         )
 
                     else:

@@ -7,17 +7,6 @@ from database import init_db
 from components.sidebar import render_sidebar
 from auth import is_logged_in, get_role
 
-
-st.sidebar.title("Navigation")
-
-page = st.sidebar.radio(
-    "Go to",
-    [
-        "Career Twin",
-        "Mock Interview"
-    ]
-)
-
 # ─── Bootstrap ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Career Twin",
@@ -28,182 +17,99 @@ st.set_page_config(
 
 init_db()  # Ensure tables exist on every cold start
 
-# ─── SESSION STATE ───────────────────────────────────────────────────────────
-if "role" not in st.session_state:
-    st.session_state.role = None
+render_sidebar()
 
-# ─── CUSTOM ROLE-BASED SIDEBAR ──────────────────────────────────────────────
+# ─── Redirect logged-in users ─────────────────────────────────────────────────
 if is_logged_in():
-
     role = get_role()
-    st.session_state.role = role
-
-    # ---------------- STUDENT SIDEBAR ----------------
     if role == "student":
-
-        st.sidebar.title("🎓 Student Panel")
-
-        page = st.sidebar.radio(
-            "Navigation",
-            [
-                "Dashboard",
-                "Resume Analysis",
-                "Placement Predictor",
-                "Recommendations",
-                "Mock Interview",
-            ]
-        )
-
-        if page == "Dashboard":
-            st.switch_page("pages/4_Student_dashboard.py")
-
-        elif page == "Resume Analysis":
-            st.switch_page("pages/6_Resume_Analysis.py")
-
-        elif page == "Placement Predictor":
-            st.switch_page("pages/7_Placement_Predictor.py")
-
-        elif page == "Recommendations":
-            st.switch_page("pages/8_Recommendations.py")
-
-        elif page == "Mock Interview":
-            st.switch_page("pages/10_Mock_Interview.py")
-
-    # ---------------- COMPANY SIDEBAR ----------------
+        st.switch_page("pages/4_Student_Dashboard.py")
     elif role == "company":
+        st.switch_page("pages/5_Company_Dashboard.py")
 
-        st.sidebar.title("🏢 Company Panel")
+# ─── Landing page ─────────────────────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;800&display=swap');
+        .hero-title {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 3.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #e94560, #f5a623);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            line-height: 1.15;
+        }
+        .hero-sub {
+            font-size: 1.15rem;
+            color: var(--ct-text-muted);
+            margin-top: 12px;
+            max-width: 560px;
+        }
+        .feature-card {
+            background: var(--ct-bg-card);
+            border: 1px solid var(--ct-border);
+            border-radius: 16px;
+            padding: 28px;
+            height: 100%;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            box-shadow: var(--ct-card-shadow);
+        }
+        .feature-card:hover {
+            border-color: #e94560;
+        }
+        .feature-icon { font-size: 2.5rem; margin-bottom: 12px; }
+        .feature-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 8px; color: var(--ct-text-title); }
+        .feature-desc  { color: var(--ct-text-muted); font-size: 0.88rem; line-height: 1.6; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-        page = st.sidebar.radio(
-            "Navigation",
-            [
-                "Dashboard",
-                "Talent Pool",
-            ]
+st.markdown('<div class="hero-title">Your AI-Powered<br>Career Co-Pilot</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero-sub">Upload your resume, discover skill gaps, predict placement '
+    'probability, and connect with top companies — all in one intelligent platform.</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("🎓  Student Login", use_container_width=True, type="primary"):
+        st.switch_page("pages/1_Student_Login.py")
+with c2:
+    if st.button("🏢  Company Login", use_container_width=True):
+        st.switch_page("pages/2_Company_Login.py")
+with c3:
+    if st.button("✍️  Create Account", use_container_width=True):
+        st.switch_page("pages/3_Signup.py")
+
+st.markdown("<br><br>", unsafe_allow_html=True)
+st.markdown("### What AI Career Twin Does For You")
+st.markdown("<br>", unsafe_allow_html=True)
+
+features = [
+    ("📄", "Resume Parsing",        "Extracts skills and context from your PDF resume using NLP."),
+    ("🎯", "Role Prediction",       "ML model predicts the best-fit job role based on your profile."),
+    ("📊", "Skill Gap Analysis",    "Radar chart visualization showing matched vs missing skills."),
+    ("📚", "Smart Recommendations", "Course and certification recommendations to close skill gaps."),
+    ("🔮", "Placement Predictor",   "Predict your placement probability using CGPA, projects & more."),
+    ("💬", "AI Career Advisor",     "Interactive AI mentor for interview prep, resume reviews & career roadmaps."),
+]
+
+cols = st.columns(3)
+for i, (icon, title, desc) in enumerate(features):
+    with cols[i % 3]:
+        st.markdown(
+            f"""
+            <div class="feature-card">
+                <div class="feature-icon">{icon}</div>
+                <div class="feature-title">{title}</div>
+                <div class="feature-desc">{desc}</div>
+            </div><br>
+            """,
+            unsafe_allow_html=True,
         )
-
-        if page == "Dashboard":
-            st.switch_page("pages/5_Company_dashboard.py")
-
-        elif page == "Talent Pool":
-            st.switch_page("pages/9_Talent_Pool.py")
-
-# ─── Landing page for non-logged users ──────────────────────────────────────
-else:
-
-    render_sidebar()
-
-    # ─── Landing page UI ────────────────────────────────────────────────────
-    st.markdown(
-        """
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;800&display=swap');
-
-            .hero-title {
-                font-family: 'Space Grotesk', sans-serif;
-                font-size: 3.2rem;
-                font-weight: 800;
-                background: linear-gradient(135deg, #e94560, #f5a623);
-                -webkit-background-clip: text;
-                -webkit-text-fill-color: transparent;
-                line-height: 1.15;
-            }
-
-            .hero-sub {
-                font-size: 1.15rem;
-                color: #888;
-                margin-top: 12px;
-                max-width: 560px;
-            }
-
-            .feature-card {
-                background: #1a1a2e;
-                border: 1px solid #2a2a4a;
-                border-radius: 16px;
-                padding: 28px;
-                height: 100%;
-                transition: border-color 0.2s;
-            }
-
-            .feature-card:hover {
-                border-color: #e94560;
-            }
-
-            .feature-icon {
-                font-size: 2.5rem;
-                margin-bottom: 12px;
-            }
-
-            .feature-title {
-                font-size: 1.1rem;
-                font-weight: 700;
-                margin-bottom: 8px;
-            }
-
-            .feature-desc {
-                color: #888;
-                font-size: 0.88rem;
-                line-height: 1.6;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="hero-title">Your AI-Powered<br>Career Co-Pilot</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="hero-sub">Upload your resume, discover skill gaps, predict placement '
-        'probability, and connect with top companies — all in one intelligent platform.</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        if st.button("🎓  Student Login", use_container_width=True, type="primary"):
-            st.switch_page("pages/1_Student_login.py")
-
-    with c2:
-        if st.button("🏢  Company Login", use_container_width=True):
-            st.switch_page("pages/2_Company_login.py")
-
-    with c3:
-        if st.button("✍️  Create Account", use_container_width=True):
-            st.switch_page("pages/3_Signup.py")
-
-    st.markdown("<br><br>", unsafe_allow_html=True)
-
-    st.markdown("### What AI Career Twin Does For You")
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    features = [
-        ("📄", "Resume Parsing", "Extracts skills and context from your PDF resume using NLP."),
-        ("🎯", "Role Prediction", "ML model predicts the best-fit job role based on your profile."),
-        ("📊", "Skill Gap Analysis", "Radar chart visualization showing matched vs missing skills."),
-        ("📚", "Smart Recommendations", "Course and certification recommendations to close skill gaps."),
-        ("🔮", "Placement Predictor", "Predict your placement probability using CGPA, projects & more."),
-        ("🏢", "Company Portal", "Companies can browse and filter a ranked talent pool."),
-    ]
-
-    cols = st.columns(3)
-
-    for i, (icon, title, desc) in enumerate(features):
-
-        with cols[i % 3]:
-
-            st.markdown(
-                f"""
-                <div class="feature-card">
-                    <div class="feature-icon">{icon}</div>
-                    <div class="feature-title">{title}</div>
-                    <div class="feature-desc">{desc}</div>
-                </div><br>
-                """,
-                unsafe_allow_html=True,
-            )
